@@ -17,13 +17,15 @@ const getopt = new Getopt([
     ['h', 'help', 'Show this help'],
     ['m', 'model=[MODEL]', 'Model to use', 'gpt-5.1'],
     ['r', 'reasoning=[EFFORT]', 'Reason effort: 0, 1, 2, 3', '0'],
-    ['v', 'verbosity=[EFFORT]', 'Verbosity: 0, 1, 2', '0'],
+    ['v', 'verbosity=[VERBOSITY]', 'Verbosity: 0, 1, 2', '0'],
     ['', 'id=[ID]', 'Response ID to retrieve'],
     ['', 'todo', 'Complete first TODO from stdin'],
     ['', 'resume', 'Resume last created response'],
     ['', 'web', 'Allow web search tool.'],
     ['', 'patch', 'Allow patch tool.'],
-    ['i', 'instructions', 'Instructions', '']
+    ['i', 'instructions', 'Instructions', ''],
+    ['s', 'schema=[SCHEMA]', 'JSON Schema for structured output', ''],
+    ['', 'new-schema', 'Print a schema template']
 ])
 
 const args = getopt.parse(process.argv.slice(2));
@@ -32,6 +34,70 @@ let prompt = args.options.instructions || '';
 let files = new Map();
 let contentRows = [];
 
+if (args.options['new-schema']) {
+    const schemaTemplate = {
+        name: "ExampleSchema",
+        strict: true,
+        schema: {
+            type: "object",
+            properties: {
+                title: {
+                    type: "string",
+                    description: "The title of the item",
+                },
+                tree: {
+                    type: "array",
+                    items: { "$ref": "#/$defs/element" },
+                },
+            },
+            required: ["title", "tree" ],
+            additionalProperties: false
+        },
+    };
+    schemaTemplate.schema['$defs'] = {
+        element: {
+            anyOf: [
+                {
+                    type: "object",
+                    properties: {
+                        title: {
+                            type: "string",
+                            description: "The title of the node",
+                        },
+                        type: {
+                            type: "string",
+                            enum: ["element"],
+                        },
+                        children: {
+                            type: "array",
+                            items: { "$ref": "#/$defs/element" },
+                            description: "Child nodes",
+                        }
+                    },
+                    required: ["title", "type", "children"],
+                    additionalProperties: false
+                },
+                {
+                    type: "object",
+                    properties: {
+                        content: {
+                            type: "string",
+                            description: "The content of the leaf node",
+                        },
+                        type: {
+                            type: "string",
+                            enum: ["leaf"],
+                        }
+                    },
+                    required: ["content", "type"],
+                    additionalProperties: false
+                }
+            ]
+        }
+    };
+    process.stdout.write(JSON.stringify(schemaTemplate, null, 2) + "\n");
+    process.exit(0);
+}
 
 const stdin = await new Promise((resolve) => {
     let data = '';
@@ -128,6 +194,23 @@ for (const row of args.argv) {
     });
 }
 
+let schema = null;
+
+if (args.options.schema) {
+    const schemaContent = await fs.readFile(args.options.schema, "utf-8").catch(() => null);
+    if (schemaContent) {
+        try {
+            schema = JSON.parse(schemaContent);
+        } catch (e) {
+            process.stderr.write(red("Failed to parse JSON schema.\n"));
+            process.exit(1);
+        }
+    } else {
+        process.stderr.write(red("Failed to read schema file.\n"));
+        process.exit(1);
+    }
+}
+
 
 if (args.options.todo) {
     prompt = 'Complete the first TODO in the input text. Only output the text that replaces the TODO, do not output any other text.';
@@ -193,8 +276,10 @@ if (contentRows.length > 0) {
 }
 
 
+
 request.instructions = prompt;
 
+request.text = {};
 
 if (args.options.model.startsWith("gpt-5")) {
     request.reasoning = {};
@@ -226,7 +311,6 @@ if (args.options.model.startsWith("gpt-5")) {
     }
 
     if (args.options.verbosity) {
-        request.text = {};
         switch (args.options.verbosity) {
             case '0':
                 request.text.verbosity = 'low';
@@ -247,6 +331,10 @@ if (args.options.model.startsWith("gpt-5")) {
     }
 }
 
+if (schema) {
+    schema.type = 'json_schema';
+    request.text.format = schema;
+}
 
 request.tools = [];
 
