@@ -5,6 +5,8 @@ import { applyDiff } from '@openai/agents';
 import fs from "fs/promises";
 import path from "path";
 import Getopt from "node-getopt";
+import { spawnSync } from "child_process";
+
 
 const inputTokenCostPer1M = 1.25;
 const outputTokenCostPer1M = 10.0;
@@ -21,12 +23,13 @@ const openai = new OpenAI({
 const getopt = new Getopt([
     ['h', 'help', 'Show this help'],
     ['m', 'model=[MODEL]', 'Model to use', 'gpt-5.1'],
-    ['r', 'reasoning=[EFFORT]', 'Reason effort: 0, 1, 2, 3', '0'],
+    ['', 'reasoning=[EFFORT]', 'Reason effort: 0, 1, 2, 3', '0'],
     ['v', 'verbosity=[VERBOSITY]', 'Verbosity: 0, 1, 2', '0'],
     ['l', 'list', 'List history'],
+    ['e', 'editor', 'Open $EDITOR to edit the prompt'],
     ['', 'id=[ID]', 'Response ID to retrieve'],
     ['', 'todo', 'Complete first TODO from stdin'],
-    ['', 'resume', 'Resume using last created response'],
+    ['r', 'resume', 'Resume using last created response'],
     ['', 'rm=[ID]', 'Remove response from history'],
     ['', 'web', 'Allow web search tool.'],
     ['', 'patch', 'Allow patch tool.'],
@@ -46,6 +49,19 @@ if (args.options.list) {
 
 let prompt = args.options.instructions || '';
 
+if (args.options.editor) {
+    const editor = process.env.EDITOR || 'vim';
+    const tmpPromptFile = path.join(tmpDir, 'prompt.txt');
+    await fs.mkdir(tmpDir, { recursive: true });
+    await fs.writeFile(tmpPromptFile, prompt, 'utf-8');
+    const edit = spawnSync(editor, [tmpPromptFile], { stdio: 'inherit' });
+    if (edit.error) {
+        process.stderr.write(red(`Failed to open editor: ${edit.error.message}\n`));
+        process.exit(1);
+    }
+    prompt = await fs.readFile(tmpPromptFile, 'utf-8');
+}
+
 if (args.options['new-schema']) {
     const schemaTemplate = newSchemaTemplate();
     process.stdout.write(JSON.stringify(schemaTemplate, null, 2) + "\n");
@@ -54,6 +70,15 @@ if (args.options['new-schema']) {
 
 const stdin = await readStdin();
 const inputRows = await parseInputRows(args);
+
+if (inputRows.length === 0) {
+    if (prompt) {
+        inputRows.push({
+            type: "input_text",
+            text: prompt,
+        });
+    }
+}
 
 
 let schema = null;
