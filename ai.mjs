@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import OpenAI from "openai";
+import { applyDiff } from '@openai/agents';
 import fs from "fs/promises";
 import path from "path";
 import Getopt from "node-getopt";
@@ -29,6 +30,7 @@ const getopt = new Getopt([
     ['', 'rm=[ID]', 'Remove response from history'],
     ['', 'web', 'Allow web search tool.'],
     ['', 'patch', 'Allow patch tool.'],
+    ['', 'apply', 'Apply patches instead of printing them.'],
     ['i', 'instructions', 'Instructions', ''],
     ['s', 'schema=[SCHEMA]', 'JSON Schema for structured output', ''],
     ['', 'new-schema', 'Print a schema template']
@@ -118,7 +120,7 @@ if (args.options.id) {
 
 if (inputRows.length == 0) {
     if (previousResponse) {
-        outputResponse(previousResponse);
+        await outputResponse(previousResponse);
         process.exit(0);
     } else {
         process.stderr.write(red("No input provided.\n\n"));
@@ -231,7 +233,7 @@ await saveRequest(response.id, request);
 
 response =  await waitForCompletion(response);
 
-outputResponse(response);
+await outputResponse(response);
 
 
 async function waitForCompletion(response) {
@@ -278,10 +280,14 @@ async function waitForCompletion(response) {
 }
 
 
-function outputResponse(response) {
+async function outputResponse(response) {
     for (const out of (response.output || [])) {
         if (out.type === 'apply_patch_call') {
-            outputPatch(out.operation);
+            if (args.options.apply) {
+                await applyPatch(out.operation);
+            } else {
+                outputPatch(out.operation);
+            }
         }
     }
 
@@ -322,6 +328,32 @@ function outputDiff(diff) {
         } else {
             process.stdout.write(gray(line) + "\n");
         }
+    }
+}
+
+async function applyPatch(operation) {
+    if (operation.type === 'update_file') {
+        const filePath = operation.path;
+        let content = await fs.readFile(filePath, 'utf-8').catch(() => '');
+        content = applyDiff(content, operation.diff);
+        await fs.writeFile(filePath, content, 'utf-8');
+        process.stdout.write(green(`Updated file: ${filePath}\n`));
+        return;
+    }
+
+    if (operation.type === 'create_file') {
+        const filePath = operation.path;
+        const content = applyDiff('', operation.diff);
+        await fs.writeFile(filePath, content, 'utf-8');
+        process.stdout.write(green(`Created file: ${filePath}\n`));
+        return;
+    }
+
+    if (operation.type === 'delete_file') {
+        const filePath = operation.filename;
+        await fs.unlink(filePath).catch(() => null);
+        process.stdout.write(red(`Deleted file: ${filePath}\n`));
+        return;
     }
 }
 
