@@ -5,6 +5,10 @@ import fs from "fs/promises";
 import path from "path";
 import Getopt from "node-getopt";
 
+const inputTokenCostPer1M = 1.25;
+const outputTokenCostPer1M = 10.0;
+const tmpDir = "/tmp/ai-cli";
+
 const token = await fs.readFile(
     path.join(process.env.HOME, ".config/openai-private.token"), "utf-8"
 );
@@ -18,9 +22,11 @@ const getopt = new Getopt([
     ['m', 'model=[MODEL]', 'Model to use', 'gpt-5.1'],
     ['r', 'reasoning=[EFFORT]', 'Reason effort: 0, 1, 2, 3', '0'],
     ['v', 'verbosity=[VERBOSITY]', 'Verbosity: 0, 1, 2', '0'],
+    ['l', 'list', 'List history'],
     ['', 'id=[ID]', 'Response ID to retrieve'],
     ['', 'todo', 'Complete first TODO from stdin'],
-    ['', 'resume', 'Resume last created response'],
+    ['', 'resume', 'Resume using last created response'],
+    ['', 'rm=[ID]', 'Remove response from history'],
     ['', 'web', 'Allow web search tool.'],
     ['', 'patch', 'Allow patch tool.'],
     ['i', 'instructions', 'Instructions', ''],
@@ -30,169 +36,23 @@ const getopt = new Getopt([
 
 const args = getopt.parse(process.argv.slice(2));
 
+if (args.options.list) {
+    await listHistory();
+    process.exit(0);
+}
+
+
 let prompt = args.options.instructions || '';
-let files = new Map();
-let contentRows = [];
 
 if (args.options['new-schema']) {
-    const schemaTemplate = {
-        name: "ExampleSchema",
-        strict: true,
-        schema: {
-            type: "object",
-            properties: {
-                title: {
-                    type: "string",
-                    description: "The title of the item",
-                },
-                tree: {
-                    type: "array",
-                    items: { "$ref": "#/$defs/element" },
-                },
-            },
-            required: ["title", "tree" ],
-            additionalProperties: false
-        },
-    };
-    schemaTemplate.schema['$defs'] = {
-        element: {
-            anyOf: [
-                {
-                    type: "object",
-                    properties: {
-                        title: {
-                            type: "string",
-                            description: "The title of the node",
-                        },
-                        type: {
-                            type: "string",
-                            enum: ["element"],
-                        },
-                        children: {
-                            type: "array",
-                            items: { "$ref": "#/$defs/element" },
-                            description: "Child nodes",
-                        }
-                    },
-                    required: ["title", "type", "children"],
-                    additionalProperties: false
-                },
-                {
-                    type: "object",
-                    properties: {
-                        content: {
-                            type: "string",
-                            description: "The content of the leaf node",
-                        },
-                        type: {
-                            type: "string",
-                            enum: ["leaf"],
-                        }
-                    },
-                    required: ["content", "type"],
-                    additionalProperties: false
-                }
-            ]
-        }
-    };
+    const schemaTemplate = newSchemaTemplate();
     process.stdout.write(JSON.stringify(schemaTemplate, null, 2) + "\n");
     process.exit(0);
 }
 
-const stdin = await new Promise((resolve) => {
-    let data = '';
-    if (process.stdin.isTTY) {
-        resolve('');
-        return;
-    }
-    process.stdin.on('data', chunk => {
-        data += chunk;
-    });
-    process.stdin.on('end', () => {
-        resolve(data);
-    });
-});
+const stdin = await readStdin();
+const inputRows = await parseInputRows(args);
 
-
-for (const row of args.argv) {
-    if (row === '-') {
-        if (stdin.trim().length > 0) {
-            contentRows.push({
-                type: "input_text",
-                text: stdin,
-            });
-        }
-        continue;
-    }
-
-    if (row.match(/^https?:\/\//)) {
-        if (isImage(row)) {
-            contentRows.push({
-                type: "input_image",
-                image_url: row,
-                detail: 'high',
-            });
-        } else {
-            const mime = getMimeType(row);
-
-            switch (mime) {
-                case 'application/pdf':
-                    contentRows.push({
-                        type: "input_file",
-                        file_url: row,
-                    });
-                    break;
-
-                default:
-                    contentRows.push({
-                        type: "input_text",
-                        text: `URL: ${row}`,
-                    });
-                    break;
-            }
-        }
-        continue;
-    }
-
-    const exists = await fs.stat(row).catch(() => null);
-
-    if (exists && exists.isFile()) {
-        const content = await fs.readFile(row);
-
-        if (isImage(row)) {
-            contentRows.push({
-                type: "input_image",
-                image_url: toDataUrl(row, content),
-                detail: 'high',
-            });
-        } else {
-            const mime = getMimeType(row);
-
-            switch (mime) {
-                case 'application/pdf':
-                    contentRows.push({
-                        type: "input_file",
-                        filename: path.basename(row),
-                        file_data: toDataUrl(row, content),
-                    });
-                    break;
-
-                default:
-                    contentRows.push({
-                        type: "input_text",
-                        text: `Filename: ${row}\n\n` + content.toString('utf-8'),
-                    });
-                    break;
-            }
-        }
-        continue;
-    }
-
-    contentRows.push({
-        type: "input_text",
-        text: row,
-    });
-}
 
 let schema = null;
 
@@ -222,14 +82,21 @@ if (args.options.help) {
     process.exit(1);
 }
 
-
-const inputTokenCostPer1M = 1.25;
-const outputTokenCostPer1M = 10.0;
-
+if (args.options.rm) {
+    const idToRemove = args.options.rm;
+    const response = await loadResponse(idToRemove);
+    if (!response) {
+        process.stderr.write(red(`Response ID ${idToRemove} not found in history.\n`));
+        process.exit(1);
+    }
+    await remove(response.id);
+    process.stdout.write(green(`Removed response ID ${idToRemove} from history.\n`));
+    process.exit(0);
+}
 
 if (args.options.resume) {
     try {
-        const lastResponseId = await fs.readFile("/tmp/ai-last_response_id.txt", "utf-8");
+        const lastResponseId = await loadLastId();
         args.options.id = lastResponseId.trim();
     } catch (e) {
         process.stderr.write(red("No last response ID found to resume.\n"));
@@ -237,27 +104,27 @@ if (args.options.resume) {
     }
 }
 
+let previousResponse = null;
 
 if (args.options.id) {
-    const filePath = `/tmp/ai-${args.options.id}.json`;
-    let response = await fs.readFile(filePath, "utf-8").catch(() => null);
-    if (response) {
-        response = JSON.parse(response);
-    } else {
+    previousResponse = await loadResponse(args.options.id);
+    if (!previousResponse) {
         process.stderr.write(gray('Retrieving existing response...\n'));
-        response = await openai.responses.retrieve(args.options.id);
-        response = await waitForCompletion(response);
-        await fs.writeFile(filePath, JSON.stringify(response));
+        previousResponse = await openai.responses.retrieve(args.options.id);
+        previousResponse = await waitForCompletion(response);
     }
-    outputResponse(response);
-    process.exit(0);
 }
 
 
-if (contentRows.length == 0) {
-    process.stderr.write(red("No input provided.\n\n"));
-    getopt.showHelp();
-    process.exit(1);
+if (inputRows.length == 0) {
+    if (previousResponse) {
+        outputResponse(previousResponse);
+        process.exit(0);
+    } else {
+        process.stderr.write(red("No input provided.\n\n"));
+        getopt.showHelp();
+        process.exit(1);
+    }
 }
 
 const request = {
@@ -265,16 +132,19 @@ const request = {
     background: true
 }
 
+if (previousResponse) {
+    request.previous_response_id = previousResponse.id;
+}
+
 request.input = [];
 
-if (contentRows.length > 0) {
+if (inputRows.length > 0) {
     request.input.push({
         type: "message",
         role: "user",
-        content: contentRows,
+        content: inputRows,
     });
 }
-
 
 
 request.instructions = prompt;
@@ -356,7 +226,8 @@ process.stderr.write(gray('Creating new response...\n'));
 
 let response = await openai.responses.create(request);
 
-fs.writeFile("/tmp/ai-last_response_id.txt", response.id);
+await saveLastId(response.id);
+await saveRequest(response.id, request);
 
 response =  await waitForCompletion(response);
 
@@ -401,36 +272,58 @@ async function waitForCompletion(response) {
     const totalCost = inputCost + outputCost;
     process.stderr.write(`${gray('Cost:')} ${white(`$${totalCost.toFixed(6)} (Input: ${inputTokens} tokens, Output: ${outputTokens} tokens)`)}\n`);
 
+    await saveResponse(response);
+
     return response;
 }
 
 
 function outputResponse(response) {
-    //console.log(response);
     for (const out of (response.output || [])) {
         if (out.type === 'apply_patch_call') {
             outputPatch(out.operation);
         }
     }
+
     process.stdout.write(response.output_text);
     process.stdout.write("\n");
 }
 
 
 function outputPatch(operation) {
-    // Normalize path (strip leading ./ if present)
-    const filePath = operation.path.replace(/^[.][/\\]/, "");
+    if (operation.type === 'update_file') {
+        process.stdout.write(cyan(`\n--- Update: ${operation.path} ---\n`));
+        outputDiff(operation.diff);
+        return;
+    }
 
-    // Body is assumed to already be in unified diff hunk format
-    if (operation.diff) {
-        if (!operation.diff.endsWith("\n")) {
-            process.stdout.write(operation.diff + "\n");
+    if (operation.type === 'create_file') {
+        process.stdout.write(cyan(`Create file: ${operation.path}\n`));
+        outputDiff(operation.diff);
+        return;
+    }
+
+    if (operation.type === 'delete_file') {
+        process.stdout.write(red(`- Deleted file: ${operation.filename}\n`));
+        return;
+    }
+    console.log(operation);
+}
+
+function outputDiff(diff) {
+    const lines = diff.split('\n');
+    for (const line of lines) {
+        if (line.startsWith('+')) {
+            process.stdout.write(green(line.substring(1)) + "\n");
+        } else if (line.startsWith('-')) {
+            process.stdout.write(red(line.substring(1)) + "\n");
+        } else if (line.startsWith('@')) {
+            process.stdout.write(cyan(line) + "\n");
         } else {
-            process.stdout.write(operation.diff);
+            process.stdout.write(gray(line) + "\n");
         }
     }
 }
-
 
 function spinnerUnicode(dt) {
     const spinners = ['⠋','⠙','⠹','⠸','⠼','⠴','⠦','⠧','⠇','⠏'];
@@ -561,5 +454,342 @@ function getMimeType(filename) {
 
         default:
             return 'application/octet-stream';
+    }
+}
+
+function newSchemaTemplate() {
+    const schemaTemplate = {
+        name: "ExampleSchema",
+        strict: true,
+        schema: {
+            type: "object",
+            properties: {
+                title: {
+                    type: "string",
+                    description: "The title of the item",
+                },
+                tree: {
+                    type: "array",
+                    items: { "$ref": "#/$defs/element" },
+                },
+            },
+            required: ["title", "tree" ],
+            additionalProperties: false
+        },
+    };
+    schemaTemplate.schema['$defs'] = {
+        element: {
+            anyOf: [
+                {
+                    type: "object",
+                    properties: {
+                        title: {
+                            type: "string",
+                            description: "The title of the node",
+                        },
+                        type: {
+                            type: "string",
+                            enum: ["element"],
+                        },
+                        children: {
+                            type: "array",
+                            items: { "$ref": "#/$defs/element" },
+                            description: "Child nodes",
+                        }
+                    },
+                    required: ["title", "type", "children"],
+                    additionalProperties: false
+                },
+                {
+                    type: "object",
+                    properties: {
+                        content: {
+                            type: "string",
+                            description: "The content of the leaf node",
+                        },
+                        type: {
+                            type: "string",
+                            enum: ["leaf"],
+                        }
+                    },
+                    required: ["content", "type"],
+                    additionalProperties: false
+                }
+            ]
+        }
+    };
+    return schemaTemplate;
+}
+
+async function readStdin() {
+    return new Promise((resolve) => {
+        let data = '';
+        if (process.stdin.isTTY) {
+            resolve('');
+            return;
+        }
+        process.stdin.on('data', chunk => {
+            data += chunk;
+        });
+        process.stdin.on('end', () => {
+            resolve(data);
+        });
+    });
+}
+
+async function save(name, content) {
+    await fs.mkdir(tmpDir, { recursive: true });
+    return fs.writeFile(path.join(tmpDir, name), content, 'utf-8');
+}
+
+async function load(name) {
+    return fs.readFile(path.join(tmpDir, name), 'utf-8').catch(() => null);
+}
+
+async function remove(id) {
+    await fs.unlink(path.join(tmpDir, `${id}.json`)).catch(() => null);
+    await fs.unlink(path.join(tmpDir, `req_${id}.json`)).catch(() => null);
+}
+
+async function loadLastId() {
+    return load("last_response_id.txt");
+}
+
+async function saveLastId(id) {
+    return save("last_response_id.txt", id);
+}
+
+async function saveRequest(id, request) {
+    return save(`req_${id}.json`, JSON.stringify(request));
+}
+
+async function loadRequest(id) {
+    const request = await load(`req_${id}.json`);
+    if (!request) {
+        return null;
+    }
+
+    return JSON.parse(request);
+}
+
+async function loadResponse(id) {
+    if (id.length < 12) {
+        const allIds = await listAllResponseIds();
+        const fullId = idFromFile(id, allIds);
+        if (!fullId) {
+            return null;
+        }
+        id = fullId;
+    }
+    const response = await load(`${id}.json`);
+    if (!response) {
+        return null;
+    }
+
+    return JSON.parse(response);
+}
+
+async function saveResponse(response) {
+    return save(`${response.id}.json`, JSON.stringify(response));
+}
+
+async function parseInputRows(args) {
+    const inputRows = [];
+    for (const row of args.argv) {
+        if (row === '-') {
+            if (stdin.trim().length > 0) {
+                inputRows.push({
+                    type: "input_text",
+                    text: stdin,
+                });
+            }
+            continue;
+        }
+
+        if (row.match(/^https?:\/\//)) {
+            if (isImage(row)) {
+                inputRows.push({
+                    type: "input_image",
+                    image_url: row,
+                    detail: 'high',
+                });
+            } else {
+                const mime = getMimeType(row);
+
+                switch (mime) {
+                    case 'application/pdf':
+                        inputRows.push({
+                            type: "input_file",
+                            file_url: row,
+                        });
+                        break;
+
+                    default:
+                        inputRows.push({
+                            type: "input_text",
+                            text: `URL: ${row}`,
+                        });
+                        break;
+                }
+            }
+            continue;
+        }
+
+        const exists = await fs.stat(row).catch(() => null);
+
+        if (exists && exists.isFile()) {
+            const content = await fs.readFile(row);
+
+            if (isImage(row)) {
+                inputRows.push({
+                    type: "input_image",
+                    image_url: toDataUrl(row, content),
+                    detail: 'high',
+                });
+            } else {
+                const mime = getMimeType(row);
+
+                switch (mime) {
+                    case 'application/pdf':
+                        inputRows.push({
+                            type: "input_file",
+                            filename: path.basename(row),
+                            file_data: toDataUrl(row, content),
+                        });
+                        break;
+
+                    default:
+                        inputRows.push({
+                            type: "input_text",
+                            text: `Filename: ${row}\n\n` + content.toString('utf-8'),
+                        });
+                        break;
+                }
+            }
+            continue;
+        }
+
+        inputRows.push({
+            type: "input_text",
+            text: row,
+        });
+    }
+
+    return inputRows;
+}
+
+function idFromFile(shortId, ids) {
+    const matches = ids
+        .filter(id => {
+            return id.endsWith(shortId);
+        });
+
+    if (matches.length > 1) {
+        throw new Error(`Ambiguous short ID: ${shortId}`);
+    }
+
+    if (matches.length === 1) {
+        return matches[0];
+    }
+
+    return null;
+}
+
+async function listAllResponseIds() {
+    await fs.mkdir(tmpDir, { recursive: true });
+    const files = await fs.readdir(tmpDir);
+    const responseIds = files
+        .filter(f => f.startsWith('resp_') && f.endsWith('.json'))
+        .map(f => path.basename(f, '.json'));
+
+    return responseIds;
+}
+
+async function listHistory() {
+    const responseIds = await listAllResponseIds();
+
+    if (responseIds.length === 0) {
+        process.stdout.write("No history found.\n");
+        return;
+    }
+
+    const responses = [];
+    for (const responseId of responseIds) {
+        const response = await loadResponse(responseId);
+        if (!response) {
+            continue;
+        }
+
+        responses.push(response);
+    }
+
+    responses.sort((a, b) => b.created_at - a.created_at);
+
+    const responseById = new Map();
+
+    for (const response of responses) {
+        responseById.set(response.id, response);
+    }
+
+    const conversationThreads = [];
+
+    const visited = new Set();
+
+    for (const response of responses) {
+        if (visited.has(response.id)) {
+            continue;
+        }
+
+        const thread = [];
+        let currentResponse = response;
+
+        while (currentResponse) {
+            thread.unshift(currentResponse);
+            visited.add(currentResponse.id);
+            if (currentResponse.previous_response_id) {
+                currentResponse = responseById.get(currentResponse.previous_response_id);
+            } else {
+                currentResponse = null;
+            }
+        }
+
+        conversationThreads.push(thread);
+    }
+
+    for (const thread of conversationThreads) {
+        for (const [index, response] of thread.entries()) {
+            const shortId = response.id.slice(-8);
+            const createdAt = new Date(response.created_at * 1000).toLocaleString('sv-SE');
+
+            const request = await loadRequest(response.id);
+
+            const inputSummary = request.input?.map(inp => {
+                if (inp.type === 'message') {
+                    const texts = inp.content.filter(c => c.type === 'input_text').map(c => c.text);
+                    return texts.join(' | ');
+                }
+                return inp.type;
+            }).join(' || ');
+
+            const outputSummary = response.output.map(out => {
+                if (out.type === 'message') {
+                    const texts = out.content.filter(c => c.type === 'output_text').map(c => c.text);
+                    return texts.join(' | ');
+                }
+                return out.type;
+            }).join(' || ');
+
+            const firstOutputLine = outputSummary.split('\n')[0];
+
+            let indent = '';
+            if (index > 0) {
+                indent = '  ';
+            }
+            process.stdout.write(`${indent}${yellow(shortId)} ${gray(createdAt)}\n`);
+            process.stdout.write(`${indent}  ${green(inputSummary)}\n`);
+            process.stdout.write(`${indent}  > ${firstOutputLine}\n`);
+            //process.stdout.write(`  ${gray('Output:')} ${outputSummary}\n`);
+            //process.stdout.write('\n');
+        }
     }
 }
