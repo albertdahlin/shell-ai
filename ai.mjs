@@ -22,21 +22,22 @@ const openai = new OpenAI({
 
 const getopt = new Getopt([
     ['h', 'help', 'Show this help'],
+    ['v', 'verbose', 'Verbose output'],
     ['m', 'model=[MODEL]', 'Model to use', 'gpt-5.1'],
     ['', 'reasoning=[EFFORT]', 'Reason effort: 0, 1, 2, 3', '0'],
-    ['v', 'verbosity=[VERBOSITY]', 'Verbosity: 0, 1, 2', '0'],
-    ['l', 'list', 'List history'],
+    ['', 'verbosity=[VERBOSITY]', 'Verbosity: 0, 1, 2', '0'],
     ['e', 'editor', 'Open $EDITOR to edit the prompt'],
-    ['', 'id=[ID]', 'Response ID to retrieve'],
     ['', 'todo', 'Complete first TODO from stdin'],
     ['r', 'resume', 'Resume using last created response'],
-    ['', 'rm=[ID]', 'Remove response from history'],
     ['', 'web', 'Allow web search tool.'],
-    ['', 'patch', 'Allow patch tool.'],
-    ['', 'apply', 'Apply patches instead of printing them.'],
+    ['p', 'patch', 'Allow patch tool.'],
+    ['a', 'apply', 'Apply patches instead of printing them.'],
     ['i', 'instructions', 'Instructions', ''],
     ['s', 'schema=[SCHEMA]', 'JSON Schema for structured output', ''],
-    ['', 'new-schema', 'Print a schema template']
+    ['', 'new-schema', 'Print a schema template'],
+    ['l', 'list', 'List history'],
+    ['', 'id=[ID]', 'Response ID to retrieve'],
+    ['', 'rm=[ID]', 'Remove response from history'],
 ])
 
 const args = getopt.parse(process.argv.slice(2));
@@ -119,6 +120,10 @@ if (args.options.rm) {
     await remove(response.id);
     process.stdout.write(green(`Removed response ID ${idToRemove} from history.\n`));
     process.exit(0);
+}
+
+if (args.options.apply && !args.options.id) {
+    args.options.resume = true;
 }
 
 if (args.options.resume) {
@@ -246,10 +251,29 @@ if (args.options.patch) {
     request.tools.push({
         type: "apply_patch",
     });
+    request.instructions += "Patch my files as needed to fulfill my request.";
+    request.model = "gpt-5.1-codex";
+    request.reasoning = {
+        effort: "high",
+    }
+    delete request.text.verbosity;
 }
 
 
 process.stderr.write(gray('Creating new response...\n'));
+
+if (args.options.verbose) {
+    for (const content of request.input[0].content) {
+        if (content.type === 'input_text') {
+            const filenameLine = content.text.match(/^Filename: (.+)\n/);
+            if (filenameLine) {
+                process.stderr.write(gray('>> Include: ') + cyan(filenameLine[1]) + '\n');
+            } else {
+                process.stderr.write(content.text + "\n");
+            }
+        }
+    }
+}
 
 let response = await openai.responses.create(request);
 
@@ -335,7 +359,7 @@ function outputPatch(operation) {
     }
 
     if (operation.type === 'delete_file') {
-        process.stdout.write(red(`- Deleted file: ${operation.filename}\n`));
+        process.stdout.write(red(`- Deleted file: ${operation.path}\n`));
         return;
     }
     console.log(operation);
@@ -375,7 +399,7 @@ async function applyPatch(operation) {
     }
 
     if (operation.type === 'delete_file') {
-        const filePath = operation.filename;
+        const filePath = operation.path;
         await fs.unlink(filePath).catch(() => null);
         process.stdout.write(red(`Deleted file: ${filePath}\n`));
         return;
@@ -823,7 +847,7 @@ async function listHistory() {
             const inputSummary = request.input?.map(inp => {
                 if (inp.type === 'message') {
                     const texts = inp.content.filter(c => c.type === 'input_text').map(c => c.text);
-                    return texts.join(' | ');
+                    return texts[0] || '';
                 }
                 return inp.type;
             }).join(' || ');
