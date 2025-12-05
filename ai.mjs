@@ -23,7 +23,7 @@ const openai = new OpenAI({
 const getopt = new Getopt([
     ['h', 'help', 'Show this help'],
     ['v', 'verbose', 'Verbose output'],
-    ['m', 'model=[MODEL]', 'Model to use', 'gpt-5.1'],
+    ['m', 'model=[MODEL]', 'Model to use'],
     ['', 'reasoning=[EFFORT]', 'Reason effort: 0, 1, 2, 3', '0'],
     ['', 'verbosity=[VERBOSITY]', 'Verbosity: 0, 1, 2', '0'],
     ['e', 'editor', 'Open $EDITOR to edit the prompt'],
@@ -160,8 +160,12 @@ if (inputRows.length == 0) {
 }
 
 const request = {
-    model: args.options.model,
+    model: 'gpt-5.1',
     background: true
+}
+
+if (args.options.model) {
+    request.model = args.options.model;
 }
 
 if (previousResponse) {
@@ -183,12 +187,12 @@ request.instructions = prompt;
 
 request.text = {};
 
-if (args.options.model.startsWith("gpt-5")) {
+if (request.model.startsWith("gpt-5")) {
     request.reasoning = {};
 
     switch (args.options.reasoning) {
         case '0':
-            if (args.options.model === "gpt-5.1") {
+            if (request.model === "gpt-5.1") {
                 request.reasoning.effort = "none";
             } else {
                 request.reasoning.effort = "minimal";
@@ -252,7 +256,9 @@ if (args.options.patch) {
         type: "apply_patch",
     });
     request.instructions += "Patch my files as needed to fulfill my request.";
-    request.model = "gpt-5.1-codex";
+    if (!args.options.model) {
+        request.model = "gpt-5.1-codex";
+    }
     request.reasoning = {
         effort: "high",
     }
