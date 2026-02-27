@@ -160,7 +160,7 @@ if (inputRows.length == 0) {
 }
 
 const request = {
-    model: 'gpt-5.1',
+    model: 'gpt-5.2',
     background: true
 }
 
@@ -192,10 +192,10 @@ if (request.model.startsWith("gpt-5")) {
 
     switch (args.options.reasoning) {
         case '0':
-            if (request.model === "gpt-5.1") {
-                request.reasoning.effort = "none";
-            } else {
+            if (request.model === "gpt-5") {
                 request.reasoning.effort = "minimal";
+            } else {
+                request.reasoning.effort = "none";
             }
             break;
 
@@ -257,7 +257,7 @@ if (args.options.patch) {
     });
     request.instructions += "Patch my files as needed to fulfill my request.";
     if (!args.options.model) {
-        request.model = "gpt-5.1-codex";
+        request.model = "gpt-5.2-codex";
     }
     request.reasoning = {
         effort: "high",
